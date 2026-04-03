@@ -53,27 +53,33 @@
 
 - (CMSampleBufferRef)makeSampleBufferWithFrameSize:(CGSize)frameSize
                                        transparent:(BOOL)transparent {
-  size_t width = (size_t)frameSize.width;
-  size_t height = (size_t)frameSize.height;
+  // 占位 buffer 只需提供正确宽高比，不需要与 preferredContentSize 等大。
+  // 将最长边缩到 4px 保持比例，大幅减少内存分配和像素填充耗时。
+  CGFloat maxEdge = MAX(frameSize.width, frameSize.height);
+  CGFloat scale = (maxEdge > 4.0) ? (4.0 / maxEdge) : 1.0;
+  size_t width = MAX(1, (size_t)(frameSize.width * scale));
+  size_t height = MAX(1, (size_t)(frameSize.height * scale));
 
   CVPixelBufferRef pixelBuffer = NULL;
-  CVPixelBufferCreate(NULL, width, height, kCVPixelFormatType_32BGRA,
-                      (__bridge CFDictionaryRef)
-                          @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}},
-                      &pixelBuffer);
+  CVReturn cvRet =
+      CVPixelBufferCreate(NULL, width, height, kCVPixelFormatType_32BGRA,
+                          (__bridge CFDictionaryRef)
+                              @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}},
+                          &pixelBuffer);
+  if (cvRet != kCVReturnSuccess || pixelBuffer == NULL) {
+    return NULL;
+  }
   CVPixelBufferLockBaseAddress(pixelBuffer, 0);
   void *base = CVPixelBufferGetBaseAddress(pixelBuffer);
-  size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
+  if (base == NULL) {
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+    CVPixelBufferRelease(pixelBuffer);
+    return NULL;
+  }
   if (transparent) {
     memset(base, 0, CVPixelBufferGetDataSize(pixelBuffer));
   } else {
-    // kCVPixelFormatType_32BGRA：不透明白底（视频 PiP 等）。
-    const uint32_t pixel = 0xFFFFFFFF;
-    int *bytes = base;
-    for (NSUInteger i = 0, length = height * bytesPerRow / 4; i < length;
-         ++i) {
-      bytes[i] = (int)pixel;
-    }
+    memset(base, 0xFF, CVPixelBufferGetDataSize(pixelBuffer));
   }
   CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
   CMSampleBufferRef sampleBuffer =
@@ -104,11 +110,11 @@
       kCFAllocatorDefault, pixelBuffer, formatDesc, &sampleTimingInfo,
       &sampleBuffer);
 
+  CFRelease(formatDesc);
+
   if (err != noErr) {
     return nil;
   }
-
-  CFRelease(formatDesc);
 
   return sampleBuffer;
 }

@@ -31,6 +31,7 @@ class PipOptions {
     this.controlStyle,
     this.iosPipHostBackgroundArgb,
     this.iosPipTransparentSampleBuffer,
+    this.isVideoCall,
   });
 
   /// Whether Picture in Picture can auto enter.
@@ -103,6 +104,10 @@ class PipOptions {
   /// 避免底层整屏不透明白/灰让 PiP 看起来「窗体巨大」。
   final bool? iosPipTransparentSampleBuffer;
 
+  /// iOS：`true` = 视频通话（宽高比 9:16，PiP 放到最大），
+  /// `false` = 语音通话（宽高比 1:1，PiP 缩到最小）。
+  final bool? isVideoCall;
+
   /// Convert the options to a dictionary.
   Map<String, dynamic> toDictionary() {
     final val = <String, dynamic>{};
@@ -141,6 +146,7 @@ class PipOptions {
           'iosPipHostBackgroundArgb', iosPipHostBackgroundArgb);
       writePropertyIfNotNull('iosPipTransparentSampleBuffer',
           iosPipTransparentSampleBuffer);
+      writePropertyIfNotNull('isVideoCall', isVideoCall);
     }
     return val;
   }

@@ -99,6 +99,9 @@ static void RtcApplyPipHostBackground(UIView *view, NSNumber *argb) {
 /// 最近一次 setup 传入的宿主背景，PiP 启动后系统可能重置，需在 didStart 再刷一层。
 @property(nonatomic, strong, nullable) NSNumber *savedIosPipHostBackgroundArgb;
 
+/// YES = 视频通话，NO = 语音通话；用于 PiP 启动后调整宽高比与尺寸。
+@property(nonatomic, assign) BOOL savedIsVideoCall;
+
 // is actived
 @property(atomic, assign) BOOL isPipActived;
 
@@ -287,6 +290,7 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
   }
 
   self.savedIosPipHostBackgroundArgb = options.iosPipHostBackgroundArgb;
+  self.savedIsVideoCall = options.isVideoCall;
 
   if (__builtin_available(iOS 15.0, *)) {
     // we allow the videoCanvas to be nil, which means to use the root view
@@ -310,6 +314,7 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
     // This ensures the pip controller is properly configured with the current
     // video source with a good user experience.
     if (_pipController == nil || _pipController.contentSource == nil) {
+      CFAbsoluteTime setupT0 = CFAbsoluteTimeGetCurrent();
 
       CGSize pref = options.preferredContentSize;
       if (pref.width <= 0 || pref.height <= 0) {
@@ -325,7 +330,13 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
 
       UIView *hostView = _pipVideoCallViewController.view;
 
+      CFAbsoluteTime setupT1 = CFAbsoluteTimeGetCurrent();
+      PIP_LOG(@"setup: VC 创建 %.0fms", (setupT1 - setupT0) * 1000);
+
       RtcInstallPipBackdrop(hostView, pref, options, &_pipBackdropView);
+
+      CFAbsoluteTime setupT2 = CFAbsoluteTimeGetCurrent();
+      PIP_LOG(@"setup: PipBackdrop 安装 %.0fms", (setupT2 - setupT1) * 1000);
 
       RtcApplyPipHostBackground(hostView, self.savedIosPipHostBackgroundArgb);
       if (_pipBackdropView != nil) {
@@ -338,8 +349,16 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
               initWithActiveVideoCallSourceView:currentVideoSourceView
                         contentViewController:_pipVideoCallViewController];
 
+      CFAbsoluteTime setupT3 = CFAbsoluteTimeGetCurrent();
+      PIP_LOG(@"setup: contentSource 创建 %.0fms", (setupT3 - setupT2) * 1000);
+
       _pipController = [[AVPictureInPictureController alloc]
           initWithContentSource:contentSource];
+
+      CFAbsoluteTime setupT4 = CFAbsoluteTimeGetCurrent();
+      PIP_LOG(@"setup: AVPictureInPictureController init %.0fms",
+              (setupT4 - setupT3) * 1000);
+
       _pipController.delegate = self;
       _pipController.canStartPictureInPictureAutomaticallyFromInline =
           options.autoEnterEnabled;
@@ -355,6 +374,9 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
         [_pipController setValue:[NSNumber numberWithInt:2]
                           forKey:@"controlsStyle"];
       }
+
+      PIP_LOG(@"setup: 首次初始化总耗时 %.0fms",
+              (CFAbsoluteTimeGetCurrent() - setupT0) * 1000);
 
 #if USE_PIP_VIEW_CONTROLLER
       NSString *pipVCName =
@@ -699,6 +721,165 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
 
   _isPipActived = YES;
   [_pipStateDelegate pipStateChanged:PipStateStarted error:nil];
+
+  [self rtc_adjustPipSizeForCallType];
+}
+
+/// 根据 isVideoCall 调整 PiP 宽高比并模拟 pinch 手势让系统将窗口放到最大或缩到最小。
+- (void)rtc_adjustPipSizeForCallType {
+  if (_pipVideoCallViewController == nil) {
+    return;
+  }
+
+  CGSize newPref;
+  if (self.savedIsVideoCall) {
+    newPref = CGSizeMake(9, 16); // 9:16 竖屏视频
+  } else {
+    newPref = CGSizeMake(1, 1);  // 1:1 语音
+  }
+
+  _pipVideoCallViewController.rtcPipPreferredContentSize = newPref;
+  RtcPipNotifyPreferredContentSizeChanged(_pipVideoCallViewController);
+
+  dispatch_after(
+      dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+      dispatch_get_main_queue(), ^{
+        [self rtc_simulatePinchOnPipWindow];
+      });
+}
+
+/// 在系统 PiP 窗口上查找并驱动 UIPinchGestureRecognizer：视频通话放大到最大，语音通话缩小到最小。
+- (void)rtc_simulatePinchOnPipWindow {
+  UIWindow *pipWindow = [self rtc_findPipWindow];
+  if (pipWindow == nil) {
+    PIP_LOG(@"rtc_simulatePinchOnPipWindow: PiP window not found");
+    return;
+  }
+
+  PIP_LOG(@"rtc_simulatePinchOnPipWindow: %@ on window %@",
+          self.savedIsVideoCall ? @"zoom-in" : @"zoom-out", pipWindow);
+
+  [self rtc_sendPinchOnView:pipWindow];
+}
+
+/// 在 PiP 窗口视图树中查找系统 UIPinchGestureRecognizer 并驱动缩放。
+- (void)rtc_sendPinchOnView:(UIView *)targetView {
+  UIPinchGestureRecognizer *pinchGR = [self rtc_findPinchGestureInView:targetView];
+  if (pinchGR == nil) {
+    PIP_LOG(@"rtc_sendPinchOnView: no pinch gesture recognizer found, "
+            @"trying recursive search in all subviews");
+    pinchGR = [self rtc_findPinchGestureRecursive:targetView];
+  }
+
+  if (pinchGR != nil) {
+    PIP_LOG(@"rtc_sendPinchOnView: found pinch GR: %@", pinchGR);
+    BOOL zoomIn = self.savedIsVideoCall;
+    CGFloat scale = zoomIn ? 5.0 : 0.1;
+    [self rtc_drivePinchGesture:pinchGR scale:scale];
+    return;
+  }
+
+  PIP_LOG(@"rtc_sendPinchOnView: no pinch gesture found, skipping pinch simulation");
+}
+
+/// 查找 targetView 直接的 pinch gesture recognizer。
+- (nullable UIPinchGestureRecognizer *)rtc_findPinchGestureInView:(UIView *)view {
+  for (UIGestureRecognizer *gr in view.gestureRecognizers) {
+    if ([gr isKindOfClass:[UIPinchGestureRecognizer class]]) {
+      return (UIPinchGestureRecognizer *)gr;
+    }
+  }
+  return nil;
+}
+
+/// 递归查找子视图树中的 UIPinchGestureRecognizer。
+- (nullable UIPinchGestureRecognizer *)rtc_findPinchGestureRecursive:(UIView *)view {
+  for (UIGestureRecognizer *gr in view.gestureRecognizers) {
+    if ([gr isKindOfClass:[UIPinchGestureRecognizer class]]) {
+      return (UIPinchGestureRecognizer *)gr;
+    }
+  }
+  for (UIView *sub in view.subviews) {
+    UIPinchGestureRecognizer *found = [self rtc_findPinchGestureRecursive:sub];
+    if (found != nil) {
+      return found;
+    }
+  }
+  return nil;
+}
+
+/// 直接驱动系统 PiP 窗口上的 UIPinchGestureRecognizer，模拟缩放。
+- (void)rtc_drivePinchGesture:(UIPinchGestureRecognizer *)pinchGR
+                         scale:(CGFloat)targetScale {
+  // 通过 KVC 设置 gesture 的 state 和 scale 来驱动。
+  // 按 began → changed → ended 的顺序模拟完整手势生命周期。
+  int totalSteps = 15;
+  NSTimeInterval stepInterval = 0.025;
+  CGFloat startScale = 1.0;
+
+  // Step 0: began
+  @try {
+    [pinchGR setValue:@(UIGestureRecognizerStateBegan) forKey:@"state"];
+    pinchGR.scale = startScale;
+  } @catch (NSException *e) {
+    PIP_LOG(@"rtc_drivePinchGesture began exception: %@", e);
+  }
+
+  for (int i = 1; i <= totalSteps; i++) {
+    CGFloat fraction = (CGFloat)i / (CGFloat)totalSteps;
+    CGFloat curScale = startScale + (targetScale - startScale) * fraction;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (int64_t)(stepInterval * i * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+          @try {
+            [pinchGR setValue:@(UIGestureRecognizerStateChanged) forKey:@"state"];
+            pinchGR.scale = curScale;
+          } @catch (NSException *e) {
+            PIP_LOG(@"rtc_drivePinchGesture changed exception: %@", e);
+          }
+        });
+  }
+
+  // Final: ended
+  dispatch_after(
+      dispatch_time(DISPATCH_TIME_NOW,
+                    (int64_t)(stepInterval * (totalSteps + 1) * NSEC_PER_SEC)),
+      dispatch_get_main_queue(), ^{
+        @try {
+          [pinchGR setValue:@(UIGestureRecognizerStateEnded) forKey:@"state"];
+        } @catch (NSException *e) {
+          PIP_LOG(@"rtc_drivePinchGesture ended exception: %@", e);
+        }
+      });
+}
+
+/// 查找系统创建的 PiP 窗口（通常是 _AVPictureInPictureWindow 或类似私有类）。
+- (nullable UIWindow *)rtc_findPipWindow {
+  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+    if (![scene isKindOfClass:[UIWindowScene class]]) {
+      continue;
+    }
+    for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+      NSString *cls = NSStringFromClass([w class]);
+      if ([cls containsString:@"PictureInPicture"] ||
+          [cls containsString:@"AVPiP"] ||
+          [cls containsString:@"PiP"]) {
+        return w;
+      }
+    }
+  }
+
+  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    NSString *cls = NSStringFromClass([w class]);
+    if ([cls containsString:@"PictureInPicture"] ||
+        [cls containsString:@"AVPiP"] ||
+        [cls containsString:@"PiP"]) {
+      return w;
+    }
+  }
+
+  return nil;
 }
 
 - (void)pictureInPictureController:

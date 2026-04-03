@@ -88,6 +88,12 @@
         options.iosPipTransparentSampleBuffer = [transparentBuf boolValue];
       }
 
+      id isVideoCallVal =
+          [call.arguments objectForKey:@"isVideoCall"];
+      if ([isVideoCallVal isKindOfClass:[NSNumber class]]) {
+        options.isVideoCall = [isVideoCallVal boolValue];
+      }
+
       BOOL ok = [self.pipController setup:options];
       if (ok) {
         [self reportPipViewSizeToFlutter];

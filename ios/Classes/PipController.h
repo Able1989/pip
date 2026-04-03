@@ -80,6 +80,9 @@ typedef NS_ENUM(NSInteger, PipState) {
 /// YES：PipView 的 sample buffer 填全透明像素（语音小窗），避免大块不透明白/灰底。
 @property(nonatomic, assign) BOOL iosPipTransparentSampleBuffer;
 
+/// YES = 视频通话（9:16 + 放大到最大），NO = 语音通话（1:1 + 缩小到最小）。
+@property(nonatomic, assign) BOOL isVideoCall;
+
 @end
 
 /**
