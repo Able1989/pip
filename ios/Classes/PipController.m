@@ -6,17 +6,9 @@
 #import <AVKit/AVKit.h>
 #import <UIKit/UIKit.h>
 
-#ifdef DEBUG
-#define ENABLE_LOG 1
-#else
-#define ENABLE_LOG 0
-#endif
-
-#if ENABLE_LOG
-#define PIP_LOG(fmt, ...) NSLog((@"[PIP] " fmt), ##__VA_ARGS__)
-#else
-#define PIP_LOG(fmt, ...)
-#endif
+// 始终打日志，便于真机连 Xcode / Console 排查 PiP 窗口与捏合模拟（上线前若嫌多可改回仅 DEBUG）。
+#define PIP_LOG(fmt, ...)                                                      \
+  NSLog((@"[PIP] %s L%d " fmt), __func__, __LINE__, ##__VA_ARGS__)
 
 #define USE_PIP_VIEW_CONTROLLER 0
 
@@ -167,6 +159,12 @@ static void RtcPipNotifyPreferredContentSizeChanged(
 #pragma clang diagnostic pop
     }
   }
+}
+
+/// 视频 9:16。语音 1:1：用较小但非退化的点数（48×48）表达正方形，避免 (1,1) 在部分系统上被当成无效，
+/// 同时给系统一个「内容尺幅偏小」的提示；真正最小化仍依赖用户捏合或下方 pinch 模拟（后者在真机上不可靠）。
+static CGSize RtcPipAspectPreferredSize(BOOL isVideoCall) {
+  return isVideoCall ? CGSizeMake(9.0, 16.0) : CGSizeMake(48.0, 48.0);
 }
 
 /// 语音 PiP：底层全透明 UIView，避免整屏 AVSampleBufferDisplayLayer 被合成成大块黑底；
@@ -323,7 +321,8 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
 
       _pipVideoCallViewController =
           [[RtcPipVideoCallContentViewController alloc] init];
-      _pipVideoCallViewController.rtcPipPreferredContentSize = pref;
+      _pipVideoCallViewController.rtcPipPreferredContentSize =
+          RtcPipAspectPreferredSize(options.isVideoCall);
       _pipVideoCallViewController.rtcForceTransparentHost =
           options.iosPipTransparentSampleBuffer;
       RtcPipNotifyPreferredContentSizeChanged(_pipVideoCallViewController);
@@ -400,15 +399,18 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
         _contentView = (UIView *)options.contentView;
       }
 
-      if (options.preferredContentSize.width > 0 &&
+      if (_pipVideoCallViewController != nil) {
+        _pipVideoCallViewController.rtcPipPreferredContentSize =
+            RtcPipAspectPreferredSize(options.isVideoCall);
+        _pipVideoCallViewController.rtcForceTransparentHost =
+            options.iosPipTransparentSampleBuffer;
+        RtcPipNotifyPreferredContentSizeChanged(_pipVideoCallViewController);
+      }
+
+      if (_pipVideoCallViewController != nil &&
+          options.preferredContentSize.width > 0 &&
           options.preferredContentSize.height > 0) {
         CGSize pref = options.preferredContentSize;
-        if (_pipVideoCallViewController != nil) {
-          _pipVideoCallViewController.rtcPipPreferredContentSize = pref;
-          _pipVideoCallViewController.rtcForceTransparentHost =
-              options.iosPipTransparentSampleBuffer;
-          RtcPipNotifyPreferredContentSizeChanged(_pipVideoCallViewController);
-        }
         BOOL wantVoiceBackdrop = options.iosPipTransparentSampleBuffer;
         BOOL haveVoiceBackdrop =
             (_pipBackdropView != nil &&
@@ -654,6 +656,7 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
     self->_isPipActived = NO;
     [self->_pipStateDelegate pipStateChanged:PipStateStopped error:nil];
   }
+
 }
 
 #pragma mark - AVPictureInPictureControllerDelegate
@@ -728,23 +731,31 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
 /// 根据 isVideoCall 调整 PiP 宽高比并模拟 pinch 手势让系统将窗口放到最大或缩到最小。
 - (void)rtc_adjustPipSizeForCallType {
   if (_pipVideoCallViewController == nil) {
+    PIP_LOG(@"rtc_adjustPipSizeForCallType: skip, pipVideoCallViewController=nil");
     return;
   }
 
-  CGSize newPref;
-  if (self.savedIsVideoCall) {
-    newPref = CGSizeMake(9, 16); // 9:16 竖屏视频
-  } else {
-    newPref = CGSizeMake(1, 1);  // 1:1 语音
-  }
+  NSString *ver = [[UIDevice currentDevice] systemVersion];
+  CGSize newPref = RtcPipAspectPreferredSize(self.savedIsVideoCall);
+  PIP_LOG(@"iOS=%@ isVideoCall=%d preferredContentSize=%.0fx%.0f ratio=%@",
+          ver, (int)self.savedIsVideoCall, newPref.width, newPref.height,
+          self.savedIsVideoCall ? @"9:16" : @"1:1");
 
   _pipVideoCallViewController.rtcPipPreferredContentSize = newPref;
   RtcPipNotifyPreferredContentSizeChanged(_pipVideoCallViewController);
 
+  [self rtc_schedulePipPinchSimulationRetries];
+}
+
+/// PiP 动画后手势就绪需要一点时间；只在一段时间后尝试一次捏合模拟，不再多轮延迟重试。
+- (void)rtc_schedulePipPinchSimulationRetries {
+  const NSTimeInterval kDelay = 0.45;
+  PIP_LOG(@"schedule pinch: single attempt after %.2fs", kDelay);
+  __weak PipController *weakSelf = self;
   dispatch_after(
-      dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+      dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDelay * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
-        [self rtc_simulatePinchOnPipWindow];
+        [weakSelf rtc_simulatePinchOnPipWindow];
       });
 }
 
@@ -757,29 +768,235 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
   }
 
   PIP_LOG(@"rtc_simulatePinchOnPipWindow: %@ on window %@",
-          self.savedIsVideoCall ? @"zoom-in" : @"zoom-out", pipWindow);
+          self.savedIsVideoCall ? @"pinch-out(max)" : @"pinch-in(min)",
+          pipWindow);
 
   [self rtc_sendPinchOnView:pipWindow];
 }
 
-/// 在 PiP 窗口视图树中查找系统 UIPinchGestureRecognizer 并驱动缩放。
+/// 是否具备 pinch 的 scale 属性（含系统私有子类，未必继承 UIPinchGestureRecognizer）。
+- (BOOL)rtc_recognizerHasPinchScale:(UIGestureRecognizer *)gr {
+  if (gr == nil) {
+    return NO;
+  }
+  if ([gr isKindOfClass:[UIPinchGestureRecognizer class]]) {
+    return YES;
+  }
+  @try {
+    [gr valueForKey:@"scale"];
+    return YES;
+  } @catch (__unused NSException *e) {
+    return NO;
+  }
+}
+
+/// 同一 `rtc_sendPinchOnView` 内对同一 view 只打一次日志（避免 hitTest 多点重复刷屏）。
+- (void)rtc_logGestureRecognizersIfAny:(UIView *)v
+                                    tag:(NSString *)tag
+                              dedupeSet:(NSMutableSet<NSNumber *> *)dedupeSet {
+  if (v.gestureRecognizers.count == 0) {
+    return;
+  }
+  if (dedupeSet != nil) {
+    NSNumber *key = @((uintptr_t)(__bridge void *)v);
+    if ([dedupeSet containsObject:key]) {
+      return;
+    }
+    [dedupeSet addObject:key];
+  }
+  for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+    BOOL hasScale = [self rtc_recognizerHasPinchScale:gr];
+    PIP_LOG(@"%@ on %@: GR class=%@ hasScaleAPI=%d", tag,
+            NSStringFromClass([v class]), NSStringFromClass([gr class]),
+            (int)hasScale);
+  }
+}
+
+/// 在若干 GR 里优先选类名含 Pinch/Zoom 且带 scale 的，否则任一带 scale 的。
+- (nullable UIGestureRecognizer *)rtc_pickBestPinchLikeFromArray:
+    (NSArray<UIGestureRecognizer *> *)grs {
+  UIGestureRecognizer *pinchNamed = nil;
+  UIGestureRecognizer *anyScale = nil;
+  for (UIGestureRecognizer *gr in grs) {
+    if (![self rtc_recognizerHasPinchScale:gr]) {
+      continue;
+    }
+    if (anyScale == nil) {
+      anyScale = gr;
+    }
+    NSString *cn = NSStringFromClass([gr class]);
+    NSRange r1 = [cn rangeOfString:@"Pinch" options:NSCaseInsensitiveSearch];
+    NSRange r2 = [cn rangeOfString:@"Zoom" options:NSCaseInsensitiveSearch];
+    if (r1.location != NSNotFound || r2.location != NSNotFound) {
+      if (pinchNamed == nil) {
+        pinchNamed = gr;
+      }
+    }
+  }
+  return pinchNamed != nil ? pinchNamed : anyScale;
+}
+
+/// BFS 整棵子树，含根视图（PiP 的 pinch 常直接挂在 UIWindow.gestureRecognizers）。
+- (nullable UIGestureRecognizer *)rtc_findPinchLikeGestureRecognizer:(UIView *)root
+                                                           dedupeSet:(NSMutableSet<NSNumber *> *)dedupeSet
+                                                            logViews:(BOOL)logViews {
+  if (root == nil) {
+    return nil;
+  }
+  NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:root];
+  while (queue.count > 0) {
+    UIView *v = queue.firstObject;
+    [queue removeObjectAtIndex:0];
+    if (logViews) {
+      [self rtc_logGestureRecognizersIfAny:v tag:@"[scan]" dedupeSet:dedupeSet];
+    }
+    UIGestureRecognizer *p =
+        [self rtc_pickBestPinchLikeFromArray:v.gestureRecognizers];
+    if (p != nil) {
+      PIP_LOG(@"findPinchLike: picked class=%@ on %@", NSStringFromClass([p class]),
+              NSStringFromClass([v class]));
+      return p;
+    }
+    for (UIView *sub in v.subviews) {
+      [queue addObject:sub];
+    }
+  }
+  return nil;
+}
+
+/// 在其他「小窗口」（非全屏）上静默找 pinch，部分系统把捏合挂在 PiP 配套遮罩窗上。
+- (nullable UIGestureRecognizer *)rtc_findPinchLikeInOtherSmallWindowsExcluding:
+    (UIWindow *)pipWin {
+  if (pipWin == nil) {
+    return nil;
+  }
+  CGRect screen = [UIScreen mainScreen].bounds;
+  CGFloat screenArea = MAX(screen.size.width * screen.size.height, 1.0);
+  const CGFloat kMaxAreaRatio = 0.42;
+  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    if (w == pipWin || w.hidden || w.alpha < 0.01) {
+      continue;
+    }
+    CGFloat a = w.frame.size.width * w.frame.size.height;
+    if (a > screenArea * kMaxAreaRatio || a < 2000.0) {
+      continue;
+    }
+    UIGestureRecognizer *p =
+        [self rtc_findPinchLikeGestureRecognizer:w dedupeSet:nil logViews:NO];
+    if (p != nil) {
+      PIP_LOG(@"findPinchLike: small window %@ area=%.0f -> GR %@",
+              NSStringFromCGRect(w.frame), a, NSStringFromClass([p class]));
+      return p;
+    }
+  }
+  return nil;
+}
+
+/// 收集子树内标准 UIPinchGestureRecognizer（兜底）。
+- (NSArray<UIPinchGestureRecognizer *> *)rtc_collectPinchGesturesUnderView:(UIView *)root {
+  NSMutableArray<UIPinchGestureRecognizer *> *list =
+      [NSMutableArray array];
+  if (root == nil) {
+    return list;
+  }
+  NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+  while (stack.count > 0) {
+    UIView *v = stack.lastObject;
+    [stack removeLastObject];
+    for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+      if ([gr isKindOfClass:[UIPinchGestureRecognizer class]]) {
+        [list addObject:(UIPinchGestureRecognizer *)gr];
+      }
+    }
+    for (UIView *sub in v.subviews) {
+      [stack addObject:sub];
+    }
+  }
+  PIP_LOG(@"collectPinch: root=%@ UIPinchGestureRecognizer count=%lu",
+          NSStringFromClass([root class]), (unsigned long)list.count);
+  return list;
+}
+
+/// hitTest 链上找带 scale 的捏合类手势。
+- (nullable UIGestureRecognizer *)rtc_findPinchByHitTestingWindow:(UIWindow *)win
+                                                        dedupeSet:(NSMutableSet<NSNumber *> *)dedupeSet {
+  if (win.bounds.size.width < 1 || win.bounds.size.height < 1) {
+    return nil;
+  }
+  NSArray<NSValue *> *points = @[
+    [NSValue valueWithCGPoint:CGPointMake(CGRectGetMidX(win.bounds),
+                                            CGRectGetMidY(win.bounds))],
+    [NSValue valueWithCGPoint:CGPointMake(CGRectGetMidX(win.bounds),
+                                            CGRectGetMinY(win.bounds) + 28)],
+    [NSValue valueWithCGPoint:CGPointMake(CGRectGetMinX(win.bounds) + 28,
+                                            CGRectGetMidY(win.bounds))],
+    [NSValue valueWithCGPoint:CGPointMake(CGRectGetMaxX(win.bounds) - 28,
+                                            CGRectGetMidY(win.bounds))],
+  ];
+  for (NSValue *pv in points) {
+    CGPoint pt = pv.CGPointValue;
+    UIView *hit = [win hitTest:pt withEvent:nil];
+    for (UIView *v = hit; v != nil; v = v.superview) {
+      [self rtc_logGestureRecognizersIfAny:v tag:@"[hitTest]" dedupeSet:dedupeSet];
+      UIGestureRecognizer *p =
+          [self rtc_pickBestPinchLikeFromArray:v.gestureRecognizers];
+      if (p != nil) {
+        PIP_LOG(@"findPinchByHitTest: hit=%@ -> %@", hit, NSStringFromClass([p class]));
+        return p;
+      }
+    }
+  }
+  return nil;
+}
+
+/// 在 PiP 窗口上查找可驱动的 pinch（含私有类），再模拟缩放。
 - (void)rtc_sendPinchOnView:(UIView *)targetView {
-  UIPinchGestureRecognizer *pinchGR = [self rtc_findPinchGestureInView:targetView];
-  if (pinchGR == nil) {
-    PIP_LOG(@"rtc_sendPinchOnView: no pinch gesture recognizer found, "
-            @"trying recursive search in all subviews");
-    pinchGR = [self rtc_findPinchGestureRecursive:targetView];
+  NSMutableSet<NSNumber *> *dedupe = [NSMutableSet set];
+  [self rtc_logGestureRecognizersIfAny:targetView tag:@"[pipTarget]" dedupeSet:dedupe];
+
+  UIGestureRecognizer *gr =
+      [self rtc_findPinchLikeGestureRecognizer:targetView dedupeSet:dedupe logViews:YES];
+  if (gr == nil && [targetView isKindOfClass:[UIWindow class]]) {
+    gr = [self rtc_findPinchByHitTestingWindow:(UIWindow *)targetView dedupeSet:dedupe];
+  }
+  if (gr == nil && [targetView isKindOfClass:[UIWindow class]]) {
+    gr = [self rtc_findPinchLikeInOtherSmallWindowsExcluding:(UIWindow *)targetView];
+  }
+  if (gr == nil) {
+    NSArray<UIPinchGestureRecognizer *> *legacy =
+        [self rtc_collectPinchGesturesUnderView:targetView];
+    gr = legacy.lastObject;
+  }
+  if (gr == nil) {
+    gr = [self rtc_findPinchGestureRecursive:targetView];
   }
 
-  if (pinchGR != nil) {
-    PIP_LOG(@"rtc_sendPinchOnView: found pinch GR: %@", pinchGR);
+  if (gr != nil) {
+    PIP_LOG(@"rtc_sendPinchOnView: drive class=%@", NSStringFromClass([gr class]));
     BOOL zoomIn = self.savedIsVideoCall;
-    CGFloat scale = zoomIn ? 5.0 : 0.1;
-    [self rtc_drivePinchGesture:pinchGR scale:scale];
+    if (zoomIn) {
+      [self rtc_drivePinchGesture:gr scale:4.0 zoomIn:YES];
+    } else {
+      [self rtc_drivePinchGesture:gr scale:0.14 zoomIn:NO];
+      __weak PipController *weakSelf = self;
+      __weak UIGestureRecognizer *weakGr = gr;
+      NSTimeInterval secondRoundDelay = 0.032 * 27 + 0.1;
+      dispatch_after(
+          dispatch_time(DISPATCH_TIME_NOW,
+                        (int64_t)(secondRoundDelay * NSEC_PER_SEC)),
+          dispatch_get_main_queue(), ^{
+            PipController *strongSelf = weakSelf;
+            UIGestureRecognizer *p = weakGr;
+            if (strongSelf == nil || p == nil || strongSelf.savedIsVideoCall) {
+              return;
+            }
+            [strongSelf rtc_drivePinchGesture:p scale:0.06 zoomIn:NO];
+          });
+    }
     return;
   }
 
-  PIP_LOG(@"rtc_sendPinchOnView: no pinch gesture found, skipping pinch simulation");
+  PIP_LOG(@"rtc_sendPinchOnView: 无 UIPinch/scale；仅依赖 preferredContentSize 与用户双指捏合。");
 }
 
 /// 查找 targetView 直接的 pinch gesture recognizer。
@@ -808,77 +1025,333 @@ static void RtcInstallPipBackdrop(UIView *hostView, CGSize pref,
   return nil;
 }
 
-/// 直接驱动系统 PiP 窗口上的 UIPinchGestureRecognizer，模拟缩放。
-- (void)rtc_drivePinchGesture:(UIPinchGestureRecognizer *)pinchGR
-                         scale:(CGFloat)targetScale {
-  // 通过 KVC 设置 gesture 的 state 和 scale 来驱动。
-  // 按 began → changed → ended 的顺序模拟完整手势生命周期。
-  int totalSteps = 15;
-  NSTimeInterval stepInterval = 0.025;
-  CGFloat startScale = 1.0;
-
-  // Step 0: began
+- (void)rtc_setRecognizerScale:(UIGestureRecognizer *)gr scale:(CGFloat)s {
   @try {
-    [pinchGR setValue:@(UIGestureRecognizerStateBegan) forKey:@"state"];
-    pinchGR.scale = startScale;
-  } @catch (NSException *e) {
-    PIP_LOG(@"rtc_drivePinchGesture began exception: %@", e);
+    if ([gr isKindOfClass:[UIPinchGestureRecognizer class]]) {
+      ((UIPinchGestureRecognizer *)gr).scale = s;
+    } else {
+      [gr setValue:@(s) forKey:@"scale"];
+    }
+  } @catch (__unused NSException *e) {
+    PIP_LOG(@"setRecognizerScale failed for %@", NSStringFromClass([gr class]));
   }
+}
+
+- (CGFloat)rtc_getRecognizerScale:(UIGestureRecognizer *)gr {
+  @try {
+    if ([gr isKindOfClass:[UIPinchGestureRecognizer class]]) {
+      return ((UIPinchGestureRecognizer *)gr).scale;
+    }
+    id v = [gr valueForKey:@"scale"];
+    if ([v isKindOfClass:[NSNumber class]]) {
+      return [(NSNumber *)v doubleValue];
+    }
+  } @catch (__unused NSException *e) {
+  }
+  return NAN;
+}
+
+/// 通过 KVC 写入手势状态并更新 scale（支持私有 pinch 子类）。
+- (void)rtc_drivePinchGesture:(UIGestureRecognizer *)pinchGR
+                         scale:(CGFloat)targetScale
+                       zoomIn:(BOOL)zoomIn {
+  int totalSteps = zoomIn ? 18 : 26;
+  NSTimeInterval stepInterval = zoomIn ? 0.028 : 0.032;
+  CGFloat startScale = 1.0;
+  PIP_LOG(@"drivePinch begin zoomIn=%d targetScale=%.3f steps=%d interval=%.3f "
+          @"gr=%@ class=%@ view=%@",
+          (int)zoomIn, targetScale, totalSteps, stepInterval, pinchGR,
+          NSStringFromClass([pinchGR class]), pinchGR.view);
+
+  void (^setGRState)(NSInteger) = ^(NSInteger st) {
+    @try {
+      [pinchGR setValue:@(st) forKey:@"state"];
+    } @catch (__unused NSException *e) {
+      @try {
+        [pinchGR setValue:@(st) forKey:@"_state"];
+      } @catch (__unused NSException *e2) {
+        PIP_LOG(@"rtc_drivePinchGesture: cannot set state %ld", (long)st);
+      }
+    }
+  };
+
+  setGRState(UIGestureRecognizerStatePossible);
+  setGRState(UIGestureRecognizerStateBegan);
+  [self rtc_setRecognizerScale:pinchGR scale:startScale];
 
   for (int i = 1; i <= totalSteps; i++) {
     CGFloat fraction = (CGFloat)i / (CGFloat)totalSteps;
     CGFloat curScale = startScale + (targetScale - startScale) * fraction;
+    __block CGFloat captured = curScale;
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW,
                       (int64_t)(stepInterval * i * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
-          @try {
-            [pinchGR setValue:@(UIGestureRecognizerStateChanged) forKey:@"state"];
-            pinchGR.scale = curScale;
-          } @catch (NSException *e) {
-            PIP_LOG(@"rtc_drivePinchGesture changed exception: %@", e);
-          }
+          setGRState(UIGestureRecognizerStateChanged);
+          [self rtc_setRecognizerScale:pinchGR scale:captured];
         });
   }
 
-  // Final: ended
+  __weak PipController *weakSelf = self;
   dispatch_after(
       dispatch_time(DISPATCH_TIME_NOW,
                     (int64_t)(stepInterval * (totalSteps + 1) * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
-        @try {
-          [pinchGR setValue:@(UIGestureRecognizerStateEnded) forKey:@"state"];
-        } @catch (NSException *e) {
-          PIP_LOG(@"rtc_drivePinchGesture ended exception: %@", e);
+        PipController *s = weakSelf;
+        if (s == nil) {
+          return;
         }
+        setGRState(UIGestureRecognizerStateEnded);
+        CGFloat endS = zoomIn ? MAX(targetScale, 1.0) : MIN(targetScale, 1.0);
+        [s rtc_setRecognizerScale:pinchGR scale:endS];
+        CGFloat readBack = [s rtc_getRecognizerScale:pinchGR];
+        PIP_LOG(@"drivePinch ended zoomIn=%d readBackScale=%.3f", (int)zoomIn,
+                readBack);
       });
 }
 
-/// 查找系统创建的 PiP 窗口（通常是 _AVPictureInPictureWindow 或类似私有类）。
-- (nullable UIWindow *)rtc_findPipWindow {
+/// 类名子串匹配（不区分大小写）。
+static BOOL RtcPipClassNameMatches(NSString *cls, NSArray<NSString *> *parts) {
+  if (cls.length == 0) {
+    return NO;
+  }
+  NSString *lower = cls.lowercaseString;
+  for (NSString *p in parts) {
+    if ([lower containsString:p.lowercaseString]) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+/// 排除明显不是 PiP 的系统窗口（iOS 新版本类名可能很普通，靠排除缩小范围）。
+static BOOL RtcPipWindowClassExcluded(NSString *cls) {
+  if (cls.length == 0) {
+    return YES;
+  }
+  NSString *l = cls.lowercaseString;
+  NSArray<NSString *> *bad = @[
+    @"keyboard",
+    @"texteffects",
+    @"statusbar",
+    @"input",
+    @"remote",
+    @"springboard",
+    @"drag",
+    @"shutter",
+    @"controlcenter",
+    @"banner",
+    @"alert",
+    @"popover",
+  ];
+  for (NSString *b in bad) {
+    if ([l containsString:b]) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+static CGFloat RtcPipWindowArea(UIWindow *w) {
+  return CGRectGetWidth(w.bounds) * CGRectGetHeight(w.bounds);
+}
+
+/// PiP 激活时打印当前所有窗口，便于对照 iOS 26+ 等新系统上的真实类名与 frame。
+- (void)rtc_logAllWindowsDiagnostic {
+  PIP_LOG(@"--- dump windows (PiP active=%d) ---",
+          (int)self->_pipController.isPictureInPictureActive);
+  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+    if (![scene isKindOfClass:[UIWindowScene class]]) {
+      continue;
+    }
+    UIWindowScene *ws = (UIWindowScene *)scene;
+    for (UIWindow *w in ws.windows) {
+      PIP_LOG(
+          @"  win class=%@ key=%d hidden=%d alpha=%.2f bounds=%@ frame=%@ "
+          @"level=%.1f",
+          NSStringFromClass([w class]), (int)w.isKeyWindow, (int)w.hidden,
+          w.alpha, NSStringFromCGRect(w.bounds), NSStringFromCGRect(w.frame),
+          w.windowLevel);
+    }
+  }
+  NSArray<UIWindow *> *legacy = [UIApplication sharedApplication].windows;
+  if (legacy.count > 0) {
+    PIP_LOG(@"  UIApplication.windows count=%lu", (unsigned long)legacy.count);
+  }
+  PIP_LOG(@"--- dump end ---");
+}
+
+/// 收集当前进程内可见窗口（去重指针）。
+- (NSMutableArray<UIWindow *> *)rtc_collectAllVisibleWindowsUnique {
+  NSMutableOrderedSet<UIWindow *> *set = [NSMutableOrderedSet orderedSet];
   for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
     if (![scene isKindOfClass:[UIWindowScene class]]) {
       continue;
     }
     for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-      NSString *cls = NSStringFromClass([w class]);
-      if ([cls containsString:@"PictureInPicture"] ||
-          [cls containsString:@"AVPiP"] ||
-          [cls containsString:@"PiP"]) {
-        return w;
+      if (w != nil) {
+        [set addObject:w];
+      }
+    }
+  }
+  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    if (w != nil) {
+      [set addObject:w];
+    }
+  }
+  NSMutableArray<UIWindow *> *arr = [NSMutableArray array];
+  for (UIWindow *w in set) {
+    [arr addObject:w];
+  }
+  return arr;
+}
+
+/// 查找系统 PiP 窗口：类名关键字 → 非全屏小窗 → 非 key 的最小面积窗（适配 iOS 18+ / 26 等类名泛化）。
+- (nullable UIWindow *)rtc_findPipWindow {
+  NSArray<NSString *> *nameHints = @[
+    @"PictureInPicture",
+    @"AVPiP",
+    @"PiP",
+    @"pip",
+    @"Floating",
+    @"Portal",
+    @"Hosted",
+    @"AVPlayer",
+    @"Inline",
+    @"Compact",
+  ];
+
+  CGRect screenRect = [UIScreen mainScreen].bounds;
+  CGFloat screenArea =
+      CGRectGetWidth(screenRect) * CGRectGetHeight(screenRect);
+  if (screenArea < 1) {
+    screenArea = 1;
+  }
+
+  UIWindow *keyWin = nil;
+  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+    if (![scene isKindOfClass:[UIWindowScene class]]) {
+      continue;
+    }
+    UIWindowScene *ws = (UIWindowScene *)scene;
+    if (ws.keyWindow != nil) {
+      keyWin = ws.keyWindow;
+      break;
+    }
+  }
+
+  NSMutableArray<UIWindow *> *hintMatched = [NSMutableArray array];
+  NSMutableArray<UIWindow *> *nonFullNonKey = [NSMutableArray array];
+  NSMutableArray<UIWindow *> *nonFullAny = [NSMutableArray array];
+  UIWindow *smallestNonKey = nil;
+  CGFloat smallestNonKeyArea = CGFLOAT_MAX;
+
+  NSArray<UIWindow *> *all = [self rtc_collectAllVisibleWindowsUnique];
+  for (UIWindow *w in all) {
+    if (w.hidden || w.alpha < 0.02) {
+      continue;
+    }
+    NSString *cls = NSStringFromClass([w class]);
+    if (RtcPipWindowClassExcluded(cls)) {
+      continue;
+    }
+
+    CGFloat bw = CGRectGetWidth(w.bounds);
+    CGFloat bh = CGRectGetHeight(w.bounds);
+    CGFloat a = bw * bh;
+    if (a < 800) {
+      continue;
+    }
+
+    if (RtcPipClassNameMatches(cls, nameHints)) {
+      [hintMatched addObject:w];
+    }
+
+    BOOL fullLike =
+        (bw >= CGRectGetWidth(screenRect) - 12 &&
+         bh >= CGRectGetHeight(screenRect) - 12);
+    if (fullLike) {
+      continue;
+    }
+
+    [nonFullAny addObject:w];
+    if (!w.isKeyWindow) {
+      [nonFullNonKey addObject:w];
+      if (a < smallestNonKeyArea) {
+        smallestNonKeyArea = a;
+        smallestNonKey = w;
       }
     }
   }
 
-  for (UIWindow *w in [UIApplication sharedApplication].windows) {
-    NSString *cls = NSStringFromClass([w class]);
-    if ([cls containsString:@"PictureInPicture"] ||
-        [cls containsString:@"AVPiP"] ||
-        [cls containsString:@"PiP"]) {
-      return w;
+  if (hintMatched.count == 1) {
+    UIWindow *w = hintMatched.firstObject;
+    PIP_LOG(@"findPipWindow: hint single class=%@ frame=%@",
+            NSStringFromClass([w class]), NSStringFromCGRect(w.frame));
+    return w;
+  }
+  if (hintMatched.count > 1) {
+    UIWindow *best = nil;
+    CGFloat bestArea = CGFLOAT_MAX;
+    for (UIWindow *w in hintMatched) {
+      CGFloat ar = RtcPipWindowArea(w);
+      if (ar > 400 && ar < bestArea) {
+        bestArea = ar;
+        best = w;
+      }
     }
+    UIWindow *picked = best != nil ? best : hintMatched.firstObject;
+    PIP_LOG(@"findPipWindow: hint multi picked class=%@ frame=%@",
+            NSStringFromClass([picked class]), NSStringFromCGRect(picked.frame));
+    return picked;
   }
 
+  // 非全屏且非 key：典型 PiP（新系统常为普通 UIWindow）；同档内取面积最小更像小窗
+  UIWindow *bandBest = nil;
+  CGFloat bandBestArea = CGFLOAT_MAX;
+  for (UIWindow *w in nonFullNonKey) {
+    CGFloat ar = RtcPipWindowArea(w);
+    if (ar >= screenArea * 0.08 && ar <= screenArea * 0.65 && ar < bandBestArea) {
+      bandBestArea = ar;
+      bandBest = w;
+    }
+  }
+  if (bandBest != nil) {
+    PIP_LOG(@"findPipWindow: nonFull+nonKey class=%@ area=%.0f frame=%@",
+            NSStringFromClass([bandBest class]), bandBestArea,
+            NSStringFromCGRect(bandBest.frame));
+    return bandBest;
+  }
+
+  if (smallestNonKey != nil && smallestNonKeyArea <= screenArea * 0.72) {
+    PIP_LOG(@"findPipWindow: smallestNonKey class=%@ area=%.0f frame=%@",
+            NSStringFromClass([smallestNonKey class]), smallestNonKeyArea,
+            NSStringFromCGRect(smallestNonKey.frame));
+    return smallestNonKey;
+  }
+
+  // 最后：任意非全屏窗口里面积最小的（PiP 可能短暂被标成 key）
+  UIWindow *minW = nil;
+  CGFloat minA = CGFLOAT_MAX;
+  for (UIWindow *w in nonFullAny) {
+    CGFloat ar = RtcPipWindowArea(w);
+    if (ar >= 1200 && ar < minA && ar <= screenArea * 0.75) {
+      minA = ar;
+      minW = w;
+    }
+  }
+  if (minW != nil) {
+    PIP_LOG(@"findPipWindow: fallback smallest non-fullscreen class=%@ "
+            @"area=%.0f frame=%@",
+            NSStringFromClass([minW class]), minA,
+            NSStringFromCGRect(minW.frame));
+    return minW;
+  }
+
+  PIP_LOG(@"findPipWindow: no match; keyWin=%@ keyArea=%.0f",
+          keyWin != nil ? NSStringFromClass([keyWin class]) : @"(nil)",
+          keyWin != nil ? RtcPipWindowArea(keyWin) : 0.0);
+  [self rtc_logAllWindowsDiagnostic];
   return nil;
 }
 

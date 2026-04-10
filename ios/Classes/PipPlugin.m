@@ -94,6 +94,12 @@
         options.isVideoCall = [isVideoCallVal boolValue];
       }
 
+      NSLog(@"[PIP] PipPlugin setup: isVideoCall=%d preferred=%.0fx%.0f "
+            @"transparentSampleBuffer=%d",
+            (int)options.isVideoCall, options.preferredContentSize.width,
+            options.preferredContentSize.height,
+            (int)options.iosPipTransparentSampleBuffer);
+
       BOOL ok = [self.pipController setup:options];
       if (ok) {
         [self reportPipViewSizeToFlutter];
